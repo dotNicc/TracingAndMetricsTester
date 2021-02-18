@@ -46,7 +46,7 @@ namespace OpenTelemetryTester
             if (trace != null && trace.IsAllDataRequested)
             {
                 trace.SetTag("Test tag", "A value for a custom tag");
-                metricsRoot.Measure.Histogram.Update(SampleHistogram, Convert.ToInt64(trace?.Duration.Milliseconds));
+                metricsRoot.Measure.Histogram.Update(SampleHistogram, Convert.ToInt64(trace.Duration.Milliseconds));
                 context = new Context(trace.Context);
                 trace.Dispose();
             }
