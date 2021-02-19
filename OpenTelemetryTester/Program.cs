@@ -20,6 +20,7 @@ namespace OpenTelemetryTester
         private static readonly ActivitySource ActivitySource = new ActivitySource(AssemblyName.Name, AssemblyName.Version.ToString());
         private static TracerProvider tracerProvider;
         
+        // Histogram metric options, used for AppMetrics
         private static HistogramOptions SampleHistogram => new HistogramOptions
         {
             Name = "My Activity Duration Histogram",
@@ -34,97 +35,76 @@ namespace OpenTelemetryTester
             
             // attach a listener to generate activities
             // the listener has callbacks to log at ActivityStart and ActivityEnd
-            ActivitySource.AddActivityListener(GetActivityListener());
+            ActivitySource.AddActivityListener(GetBatchActivityListener());
 
             // get the metrics api to generate Histograms
             IMetricsRoot metricsRoot = GetMetricsRoot();
             
             Context context = null;
+            
+            // instrument first activity
+            // sleep for 250ms and add test tag
             List<KeyValuePair<string, object>> batchAttribute = new List<KeyValuePair<string, object>> {new KeyValuePair<string, object>("batch", "1")};
-            
-            Activity trace = GetActivityFromSleep("Test activity", ActivityKind.Server, default(ActivityContext), batchAttribute, 250);
-            if (trace != null && trace.IsAllDataRequested)
+            var worker1 = new InstrumentedWorker("Test activity", ActivityKind.Server, null, batchAttribute, () => Thread.Sleep(250), ActivitySource);
+            Activity firstActivity = worker1.DoWork();
+            if (firstActivity?.IsAllDataRequested == true)
             {
-                trace.SetTag("Test tag", "A value for a custom tag");
-                metricsRoot.Measure.Histogram.Update(SampleHistogram, Convert.ToInt64(trace.Duration.Milliseconds));
-                context = new Context(trace.Context);
-                trace.Dispose();
+                firstActivity.SetTag("Test tag", "A value for a custom tag");
+                metricsRoot.Measure.Histogram.Update(SampleHistogram, Convert.ToInt64(firstActivity.Duration.Milliseconds));
+                context = new Context(firstActivity.Context);
             }
 
+            // instrument second activity
+            // sleep for 350 ms
             batchAttribute[0] = new KeyValuePair<string, object>("batch", "2");
-            
-            trace = GetActivityFromSleep("Another test activity", ActivityKind.Server, GetActivityContext(context?.TraceId, context?.SpanId, context?.TraceFlags, context?.TraceState), batchAttribute, 350);
-            if (trace != null && trace.IsAllDataRequested)
+            var worker2 = new InstrumentedWorker("Another test activity", ActivityKind.Server, context, batchAttribute, () => Thread.Sleep(350), ActivitySource);
+            Activity secondActivity = worker2.DoWork();
+            if (secondActivity?.IsAllDataRequested == true)
             {
-                context = new Context(trace.Context);
-                metricsRoot.Measure.Histogram.Update(SampleHistogram, Convert.ToInt64(trace.Duration.Milliseconds));
-                trace.Dispose();
+                metricsRoot.Measure.Histogram.Update(SampleHistogram, Convert.ToInt64(secondActivity.Duration.Milliseconds));
+                context = new Context(secondActivity.Context);
             }
             
+            // instrument third activity, keep it opened
+            // sleep for 500 ms and add events
             batchAttribute[0] = new KeyValuePair<string, object>("batch", "3");
-            
-            var activity2 = ActivitySource.StartActivity(
-                "Third test activity", 
-                ActivityKind.Internal, 
-                GetActivityContext(context?.TraceId, context?.SpanId, context?.TraceFlags, context?.TraceState), 
-                batchAttribute);
-            
-            if (activity2 != null && activity2.IsAllDataRequested)
+            var worker3 = new InstrumentedWorker("Third test activity", ActivityKind.Internal, context, batchAttribute, () => Thread.Sleep(500), ActivitySource);
+            Activity thirdActivity = worker3.StartWork();
+            if (thirdActivity?.IsAllDataRequested == true)
             {
-                context = new Context(activity2.Context);
-                activity2.AddEvent(new ActivityEvent("An event"));
+                thirdActivity.AddEvent(new ActivityEvent("An event"));
                 Thread.Sleep(500);
-                activity2.AddEvent(new ActivityEvent("An event 500ms later"));
+                thirdActivity.AddEvent(new ActivityEvent("An event 500ms later"));
+                context = new Context(thirdActivity.Context);
             }
-
+            
+            // add event using current activity
             Activity.Current?.AddEvent(new ActivityEvent("An event added to the current activity"));
             
+            // instrument fourth activity as a nested activity
+            // sleep for 500 ms
             batchAttribute[0] = new KeyValuePair<string, object>("batch", "4");
-            
-            trace = GetActivityFromSleep("Nested activity", ActivityKind.Client, GetActivityContext(context?.TraceId, context?.SpanId, context?.TraceFlags, context?.TraceState), batchAttribute, 500);
-            if (trace != null && trace.IsAllDataRequested)
+            var worker4 = new InstrumentedWorker("Nested activity", ActivityKind.Client, context, batchAttribute, () => Thread.Sleep(500), ActivitySource);
+            Activity fourthActivity = worker4.DoWork();
+            if (fourthActivity?.IsAllDataRequested == true)
             {
-                metricsRoot.Measure.Histogram.Update(SampleHistogram, Convert.ToInt64(trace.Duration.Milliseconds));
+                metricsRoot.Measure.Histogram.Update(SampleHistogram, Convert.ToInt64(fourthActivity.Duration.Milliseconds));
             }
-            
-            activity2?.Stop();
-            if (activity2 != null) metricsRoot.Measure.Histogram.Update(SampleHistogram, Convert.ToInt64(activity2.Duration.Milliseconds));
-            
+
+            // stop 3rd activity
+            thirdActivity = worker3.StopWork();
+            if (thirdActivity != null)
+            {
+                metricsRoot.Measure.Histogram.Update(SampleHistogram, Convert.ToInt64(thirdActivity.Duration.Milliseconds));
+            }
+
             // export the metrics
             await Task.WhenAll(metricsRoot.ReportRunner.RunAllAsync());
             tracerProvider.Shutdown();
         }
 
-        private static Activity GetActivityFromSleep(string activityName, ActivityKind activityKind, ActivityContext context, List<KeyValuePair<string, object>> attributes, int sleepTime)
-        {
-            Activity traceActivity;
-            using (traceActivity = ActivitySource.StartActivity(
-                activityName, 
-                activityKind,
-                context,
-                attributes))
-            {
-                // do stuff
-                Thread.Sleep(sleepTime);
-            }
-            
-            return traceActivity;
-        }
-        
-        private static ActivityContext GetActivityContext(string traceId, string spanId, string traceFlags, string traceState)
-        {
-            if (string.IsNullOrEmpty(traceId) || string.IsNullOrEmpty(spanId)) return default;
-            
-            Enum.TryParse(traceFlags, out ActivityTraceFlags flags);
-            return new ActivityContext(
-                ActivityTraceId.CreateFromString(traceId.ToCharArray()),
-                ActivitySpanId.CreateFromString(spanId.ToCharArray()),
-                flags,
-                traceState);
-
-        }
-        
-        private static ActivityListener GetActivityListener()
+        // Create listener, add callbacks on ActivityStarted and ActivityStopped to log batch activities (batch attribute needs to be there)
+        private static ActivityListener GetBatchActivityListener()
         {
             return new ActivityListener
             {
@@ -138,6 +118,7 @@ namespace OpenTelemetryTester
             };
         }
 
+        // Create tracer provider with JaegerExporter connected to endpoint localhost:6831
         private static void CreateTracerProvider()
         {
             tracerProvider = Sdk.CreateTracerProviderBuilder()
@@ -152,6 +133,7 @@ namespace OpenTelemetryTester
                 .Build();
         }
 
+        // Create metrics root, configure it to output to console
         private static IMetricsRoot GetMetricsRoot()
         {
             return new MetricsBuilder()
